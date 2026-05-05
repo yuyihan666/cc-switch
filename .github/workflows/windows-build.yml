@@ -1,0 +1,71 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or tag to build'
+        required: false
+        default: 'fix/ghostty-provider-terminal'
+        type: string
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri App (Windows)
+        run: pnpm tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ''
+        continue-on-error: true
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle/msi' -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $msi) {
+            $msi = Get-ChildItem -Path 'src-tauri/target/release/bundle' -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($msi) {
+            Copy-Item $msi.FullName (Join-Path release-assets $msi.Name)
+            Write-Host "MSI: $($msi.Name)"
+          } else {
+            Write-Warning "No MSI found"
+          }
+          $exe = Get-ChildItem -Path 'src-tauri/target/release/cc-switch.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) {
+            $exe = Get-ChildItem -Path 'src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($exe) {
+            Copy-Item $exe.FullName release-assets/
+            Write-Host "EXE: $($exe.Name)"
+          } else {
+            Write-Warning "EXE not found"
+          }
+          Get-ChildItem release-assets
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cc-switch-windows
+          path: release-assets/*
+          if-no-files-found: error
