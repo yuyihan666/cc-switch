@@ -125,6 +125,8 @@ export const handlers = [
 
   http.post(`${TAURI_ENDPOINT}/open_external`, () => success(true)),
 
+  http.post(`${TAURI_ENDPOINT}/open_provider_terminal`, () => success(true)),
+
   http.post(`${TAURI_ENDPOINT}/list_sessions`, () => success(listSessions())),
 
   http.post(`${TAURI_ENDPOINT}/get_session_messages`, async ({ request }) => {

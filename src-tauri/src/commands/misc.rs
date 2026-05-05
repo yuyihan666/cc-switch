@@ -756,6 +756,14 @@ pub async fn open_provider_terminal(
     let config = &provider.settings_config;
     let env_vars = extract_env_vars_from_config(config, &app_type);
 
+    // OpenCode: 配置已在 opencode.json 中，不需要 --settings，直接运行 CLI
+    if app_type == AppType::OpenCode {
+        let cli_path = resolve_binary_path("opencode").unwrap_or_else(|| "opencode".to_string());
+        launch_cli_terminal(&cli_path, launch_cwd.as_deref(), env_vars, "opencode")
+            .map_err(|e| format!("启动终端失败: {e}"))?;
+        return Ok(true);
+    }
+
     // 根据平台启动终端，传入提供商ID用于生成唯一的配置文件名
     launch_terminal_with_env(env_vars, &providerId, launch_cwd.as_deref())
         .map_err(|e| format!("启动终端失败: {e}"))?;
@@ -807,6 +815,18 @@ fn extract_env_vars_from_config(
     if *app_type == AppType::Gemini {
         if let Some(api_key) = obj.get("api_key").and_then(|v| v.as_str()) {
             env_vars.push(("GEMINI_API_KEY".to_string(), api_key.to_string()));
+        }
+    }
+
+    // OpenCode 从 options 中提取 apiKey 和 baseURL
+    if *app_type == AppType::OpenCode {
+        if let Some(opts) = obj.get("options").and_then(|v| v.as_object()) {
+            if let Some(key) = opts.get("apiKey").and_then(|v| v.as_str()) {
+                env_vars.push(("OPENCODE_API_KEY".to_string(), key.to_string()));
+            }
+            if let Some(url) = opts.get("baseURL").and_then(|v| v.as_str()) {
+                env_vars.push(("OPENCODE_BASE_URL".to_string(), url.to_string()));
+            }
         }
     }
 
@@ -914,7 +934,11 @@ fn write_claude_config(
 
 /// macOS: 根据用户首选终端启动
 #[cfg(target_os = "macos")]
-fn launch_macos_terminal(config_file: &std::path::Path, cwd: Option<&Path>, claude_path: &str) -> Result<(), String> {
+fn launch_macos_terminal(
+    config_file: &std::path::Path,
+    cwd: Option<&Path>,
+    claude_path: &str,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let preferred = crate::settings::get_preferred_terminal();
@@ -958,7 +982,10 @@ exec "$SHELL" -l
             // 内联命令，用 Ghostty CLI 直接执行（绕过 open）。
             // cd 由 --working-directory 处理；不用 exec（避免 Ghostty 检测到 PID 替换而弹出双 tab）
             let inline_cmd = [
-                format!("trap 'rm -f \"{config_path}\" \"{}\"' EXIT", script_file.display()),
+                format!(
+                    "trap 'rm -f \"{config_path}\" \"{}\"' EXIT",
+                    script_file.display()
+                ),
                 "echo \"Using provider-specific claude config:\"".to_string(),
                 format!("echo \"{config_path}\""),
                 format!("{claude_path} --settings \"{config_path}\""),
@@ -1095,7 +1122,11 @@ fn launch_macos_ghostty(inline_command: &str, cwd: Option<&Path>) -> Result<(), 
         if let Some(dir) = cwd {
             cmd.arg(format!("--working-directory={}", dir.display()));
         }
-        cmd.arg("-e").arg(&shell).arg("-l").arg("-c").arg(inline_command);
+        cmd.arg("-e")
+            .arg(&shell)
+            .arg("-l")
+            .arg("-c")
+            .arg(inline_command);
 
         let status = cmd
             .status()
@@ -1106,12 +1137,18 @@ fn launch_macos_ghostty(inline_command: &str, cwd: Option<&Path>) -> Result<(), 
         }
     } else {
         let mut cmd = Command::new("open");
-        cmd.arg("-a").arg("Ghostty").arg("--args")
-           .arg("--quit-after-last-window-closed=true");
+        cmd.arg("-a")
+            .arg("Ghostty")
+            .arg("--args")
+            .arg("--quit-after-last-window-closed=true");
         if let Some(dir) = cwd {
             cmd.arg(format!("--working-directory={}", dir.display()));
         }
-        cmd.arg("-e").arg(&shell).arg("-l").arg("-c").arg(inline_command);
+        cmd.arg("-e")
+            .arg(&shell)
+            .arg("-l")
+            .arg("-c")
+            .arg(inline_command);
 
         let status = cmd
             .status()
@@ -1213,7 +1250,11 @@ fn launch_macos_warp(script_file: &std::path::Path) -> Result<(), String> {
 
 /// Linux: 根据用户首选终端启动
 #[cfg(target_os = "linux")]
-fn launch_linux_terminal(config_file: &std::path::Path, cwd: Option<&Path>, claude_path: &str) -> Result<(), String> {
+fn launch_linux_terminal(
+    config_file: &std::path::Path,
+    cwd: Option<&Path>,
+    claude_path: &str,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
@@ -1341,7 +1382,11 @@ fn resolve_binary_path(cmd: &str) -> Option<String> {
             return None;
         }
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if stdout.is_empty() { None } else { Some(stdout) }
+        if stdout.is_empty() {
+            None
+        } else {
+            Some(stdout)
+        }
     }
 }
 
@@ -1438,6 +1483,39 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// 构建 CLI 终端启动脚本内容（纯函数，便于测试）
+/// 用于 OpenCode 等自带配置文件的 CLI 工具：不需要 --settings，直接运行 CLI。
+/// 脚本行为：cd 到 cwd → export 环境变量 → 运行 CLI → exec $SHELL 保持交互
+fn build_cli_terminal_script(
+    cli_path: &str,
+    cwd: Option<&Path>,
+    env_vars: &[(String, String)],
+    script_path: &str,
+) -> String {
+    let cd_command = build_shell_cd_command(cwd);
+    let exports: String = env_vars
+        .iter()
+        .map(|(key, value)| format!("export {}={}", key, shell_single_quote(value)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"#!/bin/bash
+trap 'rm -f "{script_path}"' EXIT
+{cd_command}{exports}
+{cli_path}
+exec "$SHELL" -l
+"#,
+        cd_command = cd_command,
+        exports = if exports.is_empty() {
+            String::new()
+        } else {
+            format!("{exports}\n")
+        },
+        cli_path = cli_path,
+    )
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn is_windows_unc_path(path: &str) -> bool {
     path.starts_with(r"\\")
@@ -1498,6 +1576,197 @@ fn run_windows_start_command(args: &[&str], terminal_name: &str) -> Result<(), S
     }
 
     Ok(())
+}
+
+/// 启动终端运行自带配置的 CLI 工具（如 OpenCode）。
+/// 与 `launch_terminal_with_env`（Claude --settings 模式）不同，
+/// 此函数不创建临时配置文件，而是通过 shell export 注入环境变量，
+/// 命令退出后 exec $SHELL 保持终端交互式。
+fn launch_cli_terminal(
+    cli_path: &str,
+    cwd: Option<&Path>,
+    env_vars: Vec<(String, String)>,
+    label: &str,
+) -> Result<(), String> {
+    let temp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let script_file = temp_dir.join(format!("cc_switch_{}_{}.sh", label, pid));
+    let script_path_str = script_file.to_string_lossy().to_string();
+    let script_content = build_cli_terminal_script(cli_path, cwd, &env_vars, &script_path_str);
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(&script_file, &script_content)
+            .map_err(|e| format!("写入启动脚本失败: {e}"))?;
+        std::fs::set_permissions(&script_file, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("设置脚本权限失败: {e}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let preferred = crate::settings::get_preferred_terminal();
+        let terminal = preferred.as_deref().unwrap_or("terminal");
+
+        let result = match terminal {
+            "iterm2" => launch_macos_iterm2(&script_file),
+            "warp" => launch_macos_warp(&script_file),
+            "alacritty" => launch_macos_open_app("Alacritty", &script_file, true),
+            "kitty" => launch_macos_open_app("kitty", &script_file, false),
+            "ghostty" => launch_macos_ghostty(&build_ghostty_inline_command(&script_content), cwd),
+            "wezterm" => launch_macos_open_app("WezTerm", &script_file, true),
+            "kaku" => launch_macos_open_app("Kaku", &script_file, true),
+            _ => launch_macos_terminal_app(&script_file),
+        };
+
+        if result.is_err() && terminal != "terminal" {
+            log::warn!(
+                "首选终端 {} 启动失败，回退到 Terminal.app: {:?}",
+                terminal,
+                result.as_ref().err()
+            );
+            return launch_macos_terminal_app(&script_file);
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        launch_linux_terminal_with_script(&script_file)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (temp_dir, pid);
+        let preferred = crate::settings::get_preferred_terminal();
+        let terminal = preferred.as_deref().unwrap_or("cmd");
+
+        let bat_file = temp_dir.join(format!("cc_switch_{}_{}.bat", label, pid));
+        let bat_content =
+            build_cli_terminal_bat(cli_path, cwd, &env_vars, &bat_file.to_string_lossy());
+        std::fs::write(&bat_file, &bat_content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
+
+        let bat_path = bat_file.to_string_lossy();
+        let ps_cmd = format!("& '{}'", bat_path);
+
+        let result = match terminal {
+            "powershell" => run_windows_start_command(
+                &["powershell", "-NoExit", "-Command", &ps_cmd],
+                "PowerShell",
+            ),
+            "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal"),
+            _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd"),
+        };
+
+        if result.is_err() && terminal != "cmd" {
+            log::warn!(
+                "首选终端 {} 启动失败，回退到 cmd: {:?}",
+                terminal,
+                result.as_ref().err()
+            );
+            return run_windows_start_command(&["cmd", "/K", &bat_path], "cmd");
+        }
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&bat_file);
+        }
+        result
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (cli_path, cwd, env_vars, label);
+        Err("不支持的操作系统".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_ghostty_inline_command(script_content: &str) -> String {
+    script_content
+        .lines()
+        .filter(|line| !line.starts_with("#!") && !line.starts_with("trap"))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(target_os = "linux")]
+fn launch_linux_terminal_with_script(script_file: &std::path::Path) -> Result<(), String> {
+    use std::process::Command;
+
+    let preferred = crate::settings::get_preferred_terminal();
+    let default_terminals = [
+        ("gnome-terminal", vec!["--"]),
+        ("konsole", vec!["-e"]),
+        ("xfce4-terminal", vec!["-e"]),
+        ("mate-terminal", vec!["--"]),
+        ("lxterminal", vec!["-e"]),
+        ("alacritty", vec!["-e"]),
+        ("kitty", vec!["-e"]),
+        ("ghostty", vec!["-e"]),
+    ];
+
+    let terminals_to_try: Vec<(&str, Vec<&str>)> = if let Some(ref pref) = preferred {
+        let pref_args = default_terminals
+            .iter()
+            .find(|(name, _)| *name == pref.as_str())
+            .map(|(_, args)| args.to_vec())
+            .unwrap_or_else(|| vec!["-e"]);
+        let mut list = vec![(pref.as_str(), pref_args)];
+        for (name, args) in &default_terminals {
+            if *name != pref.as_str() {
+                list.push((*name, args.to_vec()));
+            }
+        }
+        list
+    } else {
+        default_terminals
+            .iter()
+            .map(|(name, args)| (*name, args.to_vec()))
+            .collect()
+    };
+
+    for (terminal, args) in terminals_to_try {
+        let terminal_exists = which_command(terminal)
+            || ["/usr/bin", "/bin", "/usr/local/bin"]
+                .iter()
+                .any(|dir| std::path::Path::new(&format!("{}/{}", dir, terminal)).exists());
+
+        if terminal_exists {
+            let spawn_result = Command::new(terminal)
+                .args(&args)
+                .arg("bash")
+                .arg(script_file.to_string_lossy().as_ref())
+                .spawn();
+            match spawn_result {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    log::warn!("执行 {} 失败: {}", terminal, e);
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(script_file);
+    Err("未找到可用的终端".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn build_cli_terminal_bat(
+    cli_path: &str,
+    cwd: Option<&Path>,
+    env_vars: &[(String, String)],
+    bat_path: &str,
+) -> String {
+    let cd_cmd = cwd
+        .map(|dir| format!("cd /d \"{}\" || exit /b 1\r\n", dir.display()))
+        .unwrap_or_default();
+    let set_vars: String = env_vars
+        .iter()
+        .map(|(key, value)| format!("set {}={}\r\n", key, escape_windows_batch_value(value)))
+        .collect();
+    format!("@echo off\r\n{cd_cmd}{set_vars}{cli_path}\r\ndel \"{bat_path}\" >nul 2>&1\r\n",)
 }
 
 /// 打开用户首选终端并在其中执行一条命令行。脚本尾部 `read -n 1` / `pause`
@@ -1923,6 +2192,136 @@ mod tests {
         assert_eq!(
             command,
             "pushd \"\\\\server\\share\\100%%^&^(test^)\" || exit /b 1\r\n"
+        );
+    }
+
+    #[test]
+    fn extract_env_vars_opencode_extracts_api_key_and_base_url() {
+        let config = serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {
+                "apiKey": "sk-test-123",
+                "baseURL": "https://api.example.com/v1"
+            },
+            "models": {}
+        });
+
+        let env_vars = extract_env_vars_from_config(&config, &AppType::OpenCode);
+
+        let keys: Vec<&str> = env_vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            keys.contains(&"OPENCODE_API_KEY"),
+            "should contain OPENCODE_API_KEY, got: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"OPENCODE_BASE_URL"),
+            "should contain OPENCODE_BASE_URL, got: {keys:?}"
+        );
+
+        let api_key = env_vars
+            .iter()
+            .find(|(k, _)| k == "OPENCODE_API_KEY")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(api_key, "sk-test-123");
+
+        let base_url = env_vars
+            .iter()
+            .find(|(k, _)| k == "OPENCODE_BASE_URL")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(base_url, "https://api.example.com/v1");
+    }
+
+    #[test]
+    fn extract_env_vars_opencode_handles_missing_options() {
+        let config = serde_json::json!({
+            "npm": "@ai-sdk/openai-compatible",
+            "models": {}
+        });
+
+        let env_vars = extract_env_vars_from_config(&config, &AppType::OpenCode);
+        assert!(env_vars.is_empty());
+    }
+
+    #[test]
+    fn extract_env_vars_opencode_handles_empty_config() {
+        let config = serde_json::json!({});
+        let env_vars = extract_env_vars_from_config(&config, &AppType::OpenCode);
+        assert!(env_vars.is_empty());
+    }
+
+    #[test]
+    fn extract_env_vars_opencode_skips_non_string_values() {
+        let config = serde_json::json!({
+            "options": {
+                "apiKey": 12345,
+                "baseURL": null
+            }
+        });
+
+        let env_vars = extract_env_vars_from_config(&config, &AppType::OpenCode);
+        assert!(env_vars.is_empty());
+    }
+
+    #[test]
+    fn build_cli_terminal_script_contains_cd_exports_and_exec_shell() {
+        let env_vars = vec![
+            ("OPENCODE_API_KEY".to_string(), "sk-test".to_string()),
+            (
+                "OPENCODE_BASE_URL".to_string(),
+                "https://api.example.com".to_string(),
+            ),
+        ];
+
+        let script = build_cli_terminal_script(
+            "/usr/local/bin/opencode",
+            Some(Path::new("/home/user/project")),
+            &env_vars,
+            "/tmp/cc_switch_opencode_123.sh",
+        );
+
+        assert!(
+            script.contains("cd '/home/user/project'"),
+            "should cd to cwd"
+        );
+        assert!(
+            script.contains("export OPENCODE_API_KEY='sk-test'"),
+            "should export api key"
+        );
+        assert!(
+            script.contains("export OPENCODE_BASE_URL='https://api.example.com'"),
+            "should export base url"
+        );
+        assert!(
+            script.contains("/usr/local/bin/opencode"),
+            "should run opencode binary"
+        );
+        assert!(
+            script.contains("exec \"$SHELL\" -l"),
+            "should exec into interactive shell"
+        );
+        assert!(script.contains("trap"), "should clean up script file");
+    }
+
+    #[test]
+    fn build_cli_terminal_script_no_cwd_omits_cd() {
+        let script =
+            build_cli_terminal_script("opencode", None, &[], "/tmp/cc_switch_opencode_456.sh");
+
+        assert!(!script.contains("cd "), "should not cd when no cwd");
+        assert!(script.contains("opencode"), "should run opencode");
+    }
+
+    #[test]
+    fn build_cli_terminal_script_escapes_single_quotes_in_values() {
+        let env_vars = vec![("MY_KEY".to_string(), "it's a key".to_string())];
+
+        let script = build_cli_terminal_script("opencode", None, &env_vars, "/tmp/test.sh");
+
+        assert!(
+            script.contains("it'\"'\"'s a key"),
+            "should escape single quotes"
         );
     }
 }
