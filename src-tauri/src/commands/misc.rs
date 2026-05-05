@@ -1422,38 +1422,49 @@ fn launch_windows_terminal(
     let terminal = preferred.as_deref().unwrap_or("cmd");
 
     let bat_file = temp_dir.join(format!("cc_switch_claude_{}.bat", std::process::id()));
-    let config_path_for_batch = escape_windows_batch_value(&config_file.to_string_lossy());
-    let cwd_command = build_windows_cwd_command(cwd);
 
-    let content = format!(
-        "@echo off
-{cwd_command}
-echo Using provider-specific claude config:
-echo {}
-{claude_path} --settings \"{}\"
-del \"{}\" >nul 2>&1
-del \"%~f0\" >nul 2>&1
-",
-        config_path_for_batch,
-        config_path_for_batch,
-        config_path_for_batch,
-        cwd_command = cwd_command,
-        claude_path = claude_path,
-    );
+    // 批处理文件内容：纯 ASCII，通过环境变量引用路径，避免中文编码问题
+    // (goto) 2>nul 是自删除技巧：先让 CMD 释放文件句柄，再删除，避免"找不到批处理文件"
+    let content = "@echo off\r\n\
+if defined CC_SWITCH_CWD cd /d \"%CC_SWITCH_CWD%\" || exit /b 1\r\n\
+echo Using provider-specific claude config:\r\n\
+echo %CC_SWITCH_CONFIG%\r\n\
+\"%CC_SWITCH_CLAUDE%\" --settings \"%CC_SWITCH_CONFIG%\"\r\n\
+del \"%CC_SWITCH_CONFIG%\" >nul 2>&1\r\n\
+(goto) 2>nul & del \"%~f0\" >nul 2>&1\r\n";
 
-    std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
+    std::fs::write(&bat_file, content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
 
     let bat_path = bat_file.to_string_lossy();
     let ps_cmd = format!("& '{}'", bat_path);
+
+    // 通过 Command::env() 传递 UTF-16 路径，Windows 内部正确处理中文
+    let config_path = config_file.to_string_lossy().to_string();
+    let cwd_str = cwd.map(|p| p.to_string_lossy().to_string());
+
+    let mut env_vars: Vec<(&str, &str)> = vec![
+        ("CC_SWITCH_CONFIG", &config_path),
+        ("CC_SWITCH_CLAUDE", claude_path),
+    ];
+    let cwd_env_val;
+    if let Some(ref d) = cwd_str {
+        cwd_env_val = d.clone();
+        env_vars.push(("CC_SWITCH_CWD", &cwd_env_val));
+    }
 
     // Try the preferred terminal first
     let result = match terminal {
         "powershell" => run_windows_start_command(
             &["powershell", "-NoExit", "-Command", &ps_cmd],
             "PowerShell",
+            &env_vars,
         ),
-        "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal"),
-        _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd"), // "cmd" or default
+        "wt" => run_windows_start_command(
+            &["wt", "cmd", "/K", &bat_path],
+            "Windows Terminal",
+            &env_vars,
+        ),
+        _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd", &env_vars),
     };
 
     // If preferred terminal fails and it's not the default, try cmd as fallback
@@ -1463,7 +1474,7 @@ del \"%~f0\" >nul 2>&1
             terminal,
             result.as_ref().err()
         );
-        return run_windows_start_command(&["cmd", "/K", &bat_path], "cmd");
+        return run_windows_start_command(&["cmd", "/K", &bat_path], "cmd", &env_vars);
     }
 
     result
@@ -1551,16 +1562,25 @@ fn escape_windows_batch_value(value: &str) -> String {
         .replace('(', "^(")
         .replace(')', "^)")
 }
+
 /// Windows: Run a start command with common error handling
 #[cfg(target_os = "windows")]
-fn run_windows_start_command(args: &[&str], terminal_name: &str) -> Result<(), String> {
+fn run_windows_start_command(
+    args: &[&str],
+    terminal_name: &str,
+    env_vars: &[(&str, &str)],
+) -> Result<(), String> {
     use std::process::Command;
 
     let mut full_args = vec!["/C", "start"];
     full_args.extend(args);
 
-    let output = Command::new("cmd")
-        .args(&full_args)
+    let mut cmd = Command::new("cmd");
+    cmd.args(&full_args);
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    let output = cmd
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("启动 {} 失败: {e}", terminal_name))?;
@@ -1638,7 +1658,7 @@ fn launch_cli_terminal(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (temp_dir, pid);
+        let _ = (&temp_dir, pid);
         let preferred = crate::settings::get_preferred_terminal();
         let terminal = preferred.as_deref().unwrap_or("cmd");
 
@@ -1654,9 +1674,10 @@ fn launch_cli_terminal(
             "powershell" => run_windows_start_command(
                 &["powershell", "-NoExit", "-Command", &ps_cmd],
                 "PowerShell",
+                &[],
             ),
-            "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal"),
-            _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd"),
+            "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal", &[]),
+            _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd", &[]),
         };
 
         if result.is_err() && terminal != "cmd" {
@@ -1665,7 +1686,7 @@ fn launch_cli_terminal(
                 terminal,
                 result.as_ref().err()
             );
-            return run_windows_start_command(&["cmd", "/K", &bat_path], "cmd");
+            return run_windows_start_command(&["cmd", "/K", &bat_path], "cmd", &[]);
         }
 
         if result.is_err() {
@@ -1907,22 +1928,35 @@ read -n 1 -s
         let terminal = preferred.as_deref().unwrap_or("cmd");
 
         let bat_file = temp_dir.join(format!("cc_switch_{}_{}.bat", label, pid));
-        let content = format!(
-            "@echo off\r\necho [cc-switch] Starting: {cmd}\r\necho.\r\n{cmd}\r\necho.\r\necho [cc-switch] Command exited. Press any key to close.\r\npause >nul\r\ndel \"%~f0\" >nul 2>&1\r\n",
-            cmd = command_line,
-        );
-        std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
+
+        // 批处理文件内容：纯 ASCII，命令行通过环境变量传递
+        let content = "@echo off\r\n\
+echo [cc-switch] Starting: %CC_SWITCH_CMD%\r\n\
+echo.\r\n\
+%CC_SWITCH_CMD%\r\n\
+echo.\r\n\
+echo [cc-switch] Command exited. Press any key to close.\r\n\
+pause >nul\r\n\
+(goto) 2>nul & del \"%~f0\" >nul 2>&1\r\n";
+
+        std::fs::write(&bat_file, content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
 
         let bat_path = bat_file.to_string_lossy();
         let ps_cmd = format!("& '{}'", bat_path);
+        let env_vars: Vec<(&str, &str)> = vec![("CC_SWITCH_CMD", command_line)];
 
         let result = match terminal {
             "powershell" => run_windows_start_command(
                 &["powershell", "-NoExit", "-Command", &ps_cmd],
                 "PowerShell",
+                &env_vars,
             ),
-            "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal"),
-            _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd"),
+            "wt" => run_windows_start_command(
+                &["wt", "cmd", "/K", &bat_path],
+                "Windows Terminal",
+                &env_vars,
+            ),
+            _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd", &env_vars),
         };
 
         let final_result = if result.is_err() && terminal != "cmd" {
@@ -1931,7 +1965,7 @@ read -n 1 -s
                 terminal,
                 result.as_ref().err()
             );
-            run_windows_start_command(&["cmd", "/K", &bat_path], "cmd")
+            run_windows_start_command(&["cmd", "/K", &bat_path], "cmd", &env_vars)
         } else {
             result
         };
