@@ -1676,7 +1676,9 @@ fn launch_cli_terminal(
                 "PowerShell",
                 &[],
             ),
-            "wt" => run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal", &[]),
+            "wt" => {
+                run_windows_start_command(&["wt", "cmd", "/K", &bat_path], "Windows Terminal", &[])
+            }
             _ => run_windows_start_command(&["cmd", "/K", &bat_path], "cmd", &[]),
         };
 
