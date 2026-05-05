@@ -96,3 +96,84 @@ commands/  →  services/  →  database/dao/
 - Zod v4 做表单验证（`@hookform/resolvers` + `zod`）
 - `serde_json` 启用 `preserve_order` feature（保持 JSON 字段顺序）
 - shadcn/ui 组件（Radix UI 原语），组件在 `src/components/ui/`
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build & Development Commands
+
+```bash
+pnpm install          # Install dependencies
+pnpm dev              # Dev mode with hot reload (Tauri + Vite)
+pnpm build            # Production build
+pnpm typecheck        # TypeScript type check (tsc --noEmit)
+pnpm format           # Format frontend code (prettier)
+pnpm format:check     # Check formatting
+pnpm test:unit        # Frontend unit tests (vitest)
+pnpm test:unit:watch  # Frontend tests in watch mode
+```
+
+Rust backend (run from `src-tauri/`):
+```bash
+cargo fmt             # Format Rust code
+cargo clippy          # Lint Rust code
+cargo test            # Run backend tests
+cargo test --features test-hooks  # Run with test hooks enabled
+```
+
+## Architecture Overview
+
+This is a **Tauri 2 desktop app** for managing configurations of 5 AI CLI tools: Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw. The frontend is React 18 + TypeScript, the backend is Rust, and data is stored in SQLite (`~/.cc-switch/cc-switch.db`).
+
+### Layer Structure
+
+```
+Frontend (React/TS)  →  Tauri IPC (invoke + events)  →  Backend (Rust)
+                                                         ├── commands/   (Tauri #[command] functions — API layer)
+                                                         ├── services/   (Business logic layer)
+                                                         └── database/   (SQLite DAO layer: dao/ subdirectory)
+```
+
+- **`src/`** — React frontend. `@/` alias maps to `src/`.
+- **`src/lib/api/`** — Type-safe wrappers around `invoke()` for each domain (providers, mcp, prompts, settings, usage, etc.). Each file exports functions that call `invoke("<command_name>", ...)`.
+- **`src/lib/query/`** — TanStack Query v5 query/mutation definitions. Separate submodules for queries, mutations, proxy, subscription.
+- **`src/hooks/`** — Custom hooks encapsulating business logic (e.g., `useProviderActions`, `useMcp`, `useSkills`).
+- **`src/config/`** — Provider presets per CLI tool, MCP presets, constants.
+- **`src/i18n/`** — react-i18next setup (zh/en/ja).
+- **`src-tauri/src/commands/`** — Each domain has its own command file (e.g., `provider.rs`, `mcp.rs`). All re-exported via `commands/mod.rs`.
+- **`src-tauri/src/services/`** — Business logic called by commands. Key services: `ProviderService`, `McpService`, `PromptService`, `SkillService`, `ProxyService`, `ConfigService`, `SpeedtestService`.
+- **`src-tauri/src/database/dao/`** — Data access layer for each domain (providers, mcp, prompts, skills, settings, proxy, failover, usage_rollup, universal_providers).
+- **`src-tauri/src/proxy/`** — Local proxy subsystem. A self-contained HTTP proxy with format conversion, auto-failover, circuit breaker, health monitoring, SSE stream processing, and request/response rectification. Own internal module structure (`mod.rs` + 20+ files).
+
+### Key Design Patterns
+
+- **SSOT**: All config data lives in SQLite; live CLI tool config files are written from the DB, not the reverse.
+- **Atomic writes**: Temp file + rename pattern when writing CLI tool config files to prevent corruption.
+- **Dual-layer storage**: SQLite for syncable data, `settings.json` for device-level preferences.
+- **Bidirectional sync**: MCP/Prompts/Skills sync from the DB to live config files and back.
+- **Concurrency**: The SQLite connection is protected by a `Mutex<Connection>` to prevent race conditions.
+
+### App Identity
+
+CLI tools are identified by the `AppId` type: `"claude" | "codex" | "gemini" | "opencode" | "openclaw" | "hermes"`. This ID is used across the entire stack (TypeScript types → Tauri command parameters → Rust handlers).
+
+### Frontend Testing
+
+- **vitest** with **jsdom** environment and `globals: true`.
+- **MSW** (Mock Service Worker) mocks Tauri `invoke()` calls — `tests/msw/tauriMocks.ts` sets up the mock layer, intercepting calls to a fake `http://tauri.local` endpoint.
+- Tests use `@testing-library/react` for component rendering.
+- Setup files: `tests/setupGlobals.ts`, `tests/setupTests.ts`.
+
+### CI
+
+CI runs on PRs and pushes to `main`:
+- **Frontend**: `pnpm typecheck` → `pnpm format:check` → `pnpm test:unit`
+- **Backend**: `cargo fmt --check` → `cargo clippy` → `cargo test`
+
+### Tech Stack
+
+Frontend: React 18 · TypeScript · Vite · TailwindCSS 3 · TanStack Query v5 · shadcn/ui (Radix UI primitives) · react-i18next · react-hook-form + zod · recharts · @dnd-kit
+
+Backend: Tauri 2.8 · Rust · rusqlite (SQLite) · serde/serde_json · tokio · reqwest · hyper (proxy)
+
+Testing: vitest · MSW · @testing-library/react · jsdom

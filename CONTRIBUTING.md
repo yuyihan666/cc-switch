@@ -79,6 +79,7 @@ cd src-tauri && cargo fmt --check && cargo clippy && cargo test
 
 - [ ] `pnpm typecheck` passes
 - [ ] `pnpm format:check` passes
+- [ ] `cargo fmt --check` passes (if Rust code changed)
 - [ ] `cargo clippy` passes (if Rust code changed)
 - [ ] Updated i18n files if user-facing text changed
 
@@ -207,6 +208,7 @@ cd src-tauri && cargo fmt --check && cargo clippy && cargo test
 
 - [ ] `pnpm typecheck` 通过
 - [ ] `pnpm format:check` 通过
+- [ ] `cargo fmt --check` 通过（如修改了 Rust 代码）
 - [ ] `cargo clippy` 通过（如修改了 Rust 代码）
 - [ ] 如修改了用户可见文本，已更新国际化文件
 
