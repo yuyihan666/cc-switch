@@ -1,4 +1,6 @@
-# AGENTS.md
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Quick Reference
 
@@ -96,84 +98,82 @@ commands/  →  services/  →  database/dao/
 - Zod v4 做表单验证（`@hookform/resolvers` + `zod`）
 - `serde_json` 启用 `preserve_order` feature（保持 JSON 字段顺序）
 - shadcn/ui 组件（Radix UI 原语），组件在 `src/components/ui/`
-# CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## PR Process
 
-## Build & Development Commands
+### 分支与提交
+
+- 分支命名：`feat/xxx`、`fix/xxx`、`chore/xxx`
+- 提交格式遵循 [Conventional Commits](https://www.conventionalcommits.org/)：`feat(provider): add support for new provider`
+
+### 提交前 Checklist
+
+改了 Rust 代码必须跑完这 6 步再 push，CI 不会替你格式化：
 
 ```bash
-pnpm install          # Install dependencies
-pnpm dev              # Dev mode with hot reload (Tauri + Vite)
-pnpm build            # Production build
-pnpm typecheck        # TypeScript type check (tsc --noEmit)
-pnpm format           # Format frontend code (prettier)
-pnpm format:check     # Check formatting
-pnpm test:unit        # Frontend unit tests (vitest)
-pnpm test:unit:watch  # Frontend tests in watch mode
+pnpm typecheck && pnpm format:check && pnpm test:unit
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Rust backend (run from `src-tauri/`):
+如果 `cargo fmt --check` 报 diff，直接跑 `cargo fmt --manifest-path src-tauri/Cargo.toml` 修复后再提交。
+
+改了用户可见文本需要同步更新 3 个 locale 文件：`src/locales/{en,zh,ja}/translation.json`
+
+### 用 gh 提交 PR 的完整流程
+
+以下流程适用于 AI agent 自主操作或人工通过 CLI 提交：
+
 ```bash
-cargo fmt             # Format Rust code
-cargo clippy          # Lint Rust code
-cargo test            # Run backend tests
-cargo test --features test-hooks  # Run with test hooks enabled
+# 1. 从最新 main 创建分支
+git checkout main && git pull
+git checkout -b feat/my-feature
+
+# 2. 编码 + 验证（见上方 Checklist）
+# ... 改代码 ...
+pnpm typecheck && pnpm format:check && pnpm test:unit
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
+
+# 3. 提交
+git add <具体文件>        # 不要 git add -A，避免提交无关文件
+git commit                # 用 Conventional Commits 格式
+
+# 4. 推送（首次推送用 -u）
+git push -u origin feat/my-feature
+
+# 5. 创建 PR
+gh pr create --title "feat(scope): 简短标题" --body "$(cat <<'EOF'
+## Summary
+- 改动要点 1
+- 改动要点 2
+
+## Test plan
+- [ ] 验证步骤 1
+- [ ] 验证步骤 2
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+EOF
+)"
 ```
 
-## Architecture Overview
+**注意事项**：
+- `git add` 指定具体文件，不要用 `-A` 或 `.`，避免提交 `.env`、临时文件等
+- PR 标题不超过 70 字符，body 包含 Summary + Test plan
+- 推送前确认 `cargo fmt --check` 和 `cargo clippy` 都通过，否则 CI 必挂
+- 如果是 fork 仓库的 PR，`gh pr create` 会自动处理 fork + remote
 
-This is a **Tauri 2 desktop app** for managing configurations of 5 AI CLI tools: Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw. The frontend is React 18 + TypeScript, the backend is Rust, and data is stored in SQLite (`~/.cc-switch/cc-switch.db`).
+## AI Agent Pitfalls
 
-### Layer Structure
+以下是 AI agent 在本项目中容易犯的错误，改动前对照检查：
 
-```
-Frontend (React/TS)  →  Tauri IPC (invoke + events)  →  Backend (Rust)
-                                                         ├── commands/   (Tauri #[command] functions — API layer)
-                                                         ├── services/   (Business logic layer)
-                                                         └── database/   (SQLite DAO layer: dao/ subdirectory)
-```
-
-- **`src/`** — React frontend. `@/` alias maps to `src/`.
-- **`src/lib/api/`** — Type-safe wrappers around `invoke()` for each domain (providers, mcp, prompts, settings, usage, etc.). Each file exports functions that call `invoke("<command_name>", ...)`.
-- **`src/lib/query/`** — TanStack Query v5 query/mutation definitions. Separate submodules for queries, mutations, proxy, subscription.
-- **`src/hooks/`** — Custom hooks encapsulating business logic (e.g., `useProviderActions`, `useMcp`, `useSkills`).
-- **`src/config/`** — Provider presets per CLI tool, MCP presets, constants.
-- **`src/i18n/`** — react-i18next setup (zh/en/ja).
-- **`src-tauri/src/commands/`** — Each domain has its own command file (e.g., `provider.rs`, `mcp.rs`). All re-exported via `commands/mod.rs`.
-- **`src-tauri/src/services/`** — Business logic called by commands. Key services: `ProviderService`, `McpService`, `PromptService`, `SkillService`, `ProxyService`, `ConfigService`, `SpeedtestService`.
-- **`src-tauri/src/database/dao/`** — Data access layer for each domain (providers, mcp, prompts, skills, settings, proxy, failover, usage_rollup, universal_providers).
-- **`src-tauri/src/proxy/`** — Local proxy subsystem. A self-contained HTTP proxy with format conversion, auto-failover, circuit breaker, health monitoring, SSE stream processing, and request/response rectification. Own internal module structure (`mod.rs` + 20+ files).
-
-### Key Design Patterns
-
-- **SSOT**: All config data lives in SQLite; live CLI tool config files are written from the DB, not the reverse.
-- **Atomic writes**: Temp file + rename pattern when writing CLI tool config files to prevent corruption.
-- **Dual-layer storage**: SQLite for syncable data, `settings.json` for device-level preferences.
-- **Bidirectional sync**: MCP/Prompts/Skills sync from the DB to live config files and back.
-- **Concurrency**: The SQLite connection is protected by a `Mutex<Connection>` to prevent race conditions.
-
-### App Identity
-
-CLI tools are identified by the `AppId` type: `"claude" | "codex" | "gemini" | "opencode" | "openclaw" | "hermes"`. This ID is used across the entire stack (TypeScript types → Tauri command parameters → Rust handlers).
-
-### Frontend Testing
-
-- **vitest** with **jsdom** environment and `globals: true`.
-- **MSW** (Mock Service Worker) mocks Tauri `invoke()` calls — `tests/msw/tauriMocks.ts` sets up the mock layer, intercepting calls to a fake `http://tauri.local` endpoint.
-- Tests use `@testing-library/react` for component rendering.
-- Setup files: `tests/setupGlobals.ts`, `tests/setupTests.ts`.
-
-### CI
-
-CI runs on PRs and pushes to `main`:
-- **Frontend**: `pnpm typecheck` → `pnpm format:check` → `pnpm test:unit`
-- **Backend**: `cargo fmt --check` → `cargo clippy` → `cargo test`
-
-### Tech Stack
-
-Frontend: React 18 · TypeScript · Vite · TailwindCSS 3 · TanStack Query v5 · shadcn/ui (Radix UI primitives) · react-i18next · react-hook-form + zod · recharts · @dnd-kit
-
-Backend: Tauri 2.8 · Rust · rusqlite (SQLite) · serde/serde_json · tokio · reqwest · hyper (proxy)
-
-Testing: vitest · MSW · @testing-library/react · jsdom
+1. **Rust 改动后忘记 `cargo fmt`** — 这是最常见的 CI 失败原因。改了任何 `.rs` 文件，最后必须跑 `cargo fmt`，再跑 `--check` 确认无 diff
+2. **改了数据库 schema 但没递增 `SCHEMA_VERSION`** — 改表结构必须同时改 `src-tauri/src/database/schema.rs`，递增版本号并添加迁移逻辑
+3. **直接写 CLI 配置文件而不是通过 DB** — 所有配置数据以 SQLite 为 SSOT，CLI 工具的配置文件是从 DB 写出的，不要反向操作
+4. **给 OpenClaw 添加 MCP 或 Skills 功能** — OpenClaw 不支持这两个功能，相关逻辑必须跳过
+5. **用户可见文本硬编码** — 所有 UI 文本必须用 i18next 的 `t()` 函数，并同步更新 zh/en/ja 三个语言文件
+6. **从项目根目录直接跑 `cargo fmt`** — 必须加 `--manifest-path src-tauri/Cargo.toml`，否则找不到 crate
+7. **新增 Tauri command 不用 camelCase** — Tauri 2.0 要求 command 名用 camelCase（如 `getProviders`），不是 snake_case
+8. **写配置文件没用原子写入** — 必须用 temp file + rename 模式，参考 `services/` 中已有的 `write_file_atomic` 实现
