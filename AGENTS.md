@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **本文件即 `AGENTS.md`**:`CLAUDE.md` 是 `AGENTS.md` 的软链(由 `setup-agent-links.sh` 维护),改 `AGENTS.md` 即同步生效。若软链断裂,执行 `bash setup-agent-links.sh` 修复。
+
 ## Quick Reference
 
 | Action | Command |
@@ -52,10 +54,11 @@ commands/  →  services/  →  database/dao/
 (Tauri API)   (业务逻辑)     (SQLite DAO)
 ```
 
-- `commands/` 中每个域一个文件（`provider.rs`, `mcp.rs` 等），全部在 `mod.rs` 中 `pub use *` 导出
-- `services/` 是业务逻辑层，主要入口：`ProviderService`, `McpService`, `PromptService`, `SkillService`, `ProxyService`, `ConfigService`
-- `database/dao/` 每个域一个文件，`Database` struct 通过 `impl` 块提供 DAO 方法
-- `proxy/` 是独立的本地 HTTP 代理子系统（20+ 文件），有自己的模块结构
+- `commands/` 中每个域一个文件或子模块(30+ 文件),全部在 `mod.rs` 中 `pub use *` 导出
+- `services/` 是业务逻辑层,主要入口:`ProviderService`, `McpService`, `PromptService`, `SkillService`, `ProxyService`, `ConfigService`(部分服务是子目录,如 `services/provider/`、`services/webdav_sync/`)
+- `database/dao/` 每个域一个文件(现有 12 个 DAO),`Database` struct 通过 `impl` 块提供 DAO 方法
+- `proxy/` 是独立的本地 HTTP 代理子系统(30+ 文件),支持多 Provider 故障转移和请求透传
+- **`src-tauri/src/lib.rs`(1777 行)是 Tauri 启动器 + 命令注册中心**:`tauri::generate_handler![]` 块在第 1032 行,新增 Tauri command 必须在此注册,否则前端 `invoke()` 找不到
 
 ### 前端结构
 
@@ -119,7 +122,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 如果 `cargo fmt --check` 报 diff，直接跑 `cargo fmt --manifest-path src-tauri/Cargo.toml` 修复后再提交。
 
-改了用户可见文本需要同步更新 3 个 locale 文件：`src/locales/{en,zh,ja}/translation.json`
+改了用户可见文本需要同步更新 3 个 locale 文件:`src/i18n/locales/{en,zh,ja}.json`
 
 ### 用 gh 提交 PR 的完整流程
 
@@ -167,13 +170,10 @@ EOF
 
 ## AI Agent Pitfalls
 
-以下是 AI agent 在本项目中容易犯的错误，改动前对照检查：
+以下是 AI agent 在本项目中容易犯的错误,改动前对照检查(只列**反直觉、正文未覆盖**的几条):
 
-1. **Rust 改动后忘记 `cargo fmt`** — 这是最常见的 CI 失败原因。改了任何 `.rs` 文件，最后必须跑 `cargo fmt`，再跑 `--check` 确认无 diff
-2. **改了数据库 schema 但没递增 `SCHEMA_VERSION`** — 改表结构必须同时改 `src-tauri/src/database/schema.rs`，递增版本号并添加迁移逻辑
-3. **直接写 CLI 配置文件而不是通过 DB** — 所有配置数据以 SQLite 为 SSOT，CLI 工具的配置文件是从 DB 写出的，不要反向操作
-4. **给 OpenClaw 添加 MCP 或 Skills 功能** — OpenClaw 不支持这两个功能，相关逻辑必须跳过
-5. **用户可见文本硬编码** — 所有 UI 文本必须用 i18next 的 `t()` 函数，并同步更新 zh/en/ja 三个语言文件
-6. **从项目根目录直接跑 `cargo fmt`** — 必须加 `--manifest-path src-tauri/Cargo.toml`，否则找不到 crate
-7. **新增 Tauri command 不用 camelCase** — Tauri 2.0 要求 command 名用 camelCase（如 `getProviders`），不是 snake_case
-8. **写配置文件没用原子写入** — 必须用 temp file + rename 模式，参考 `services/` 中已有的 `write_file_atomic` 实现
+1. **改了数据库 schema 但没递增 `SCHEMA_VERSION`** — 改表结构必须同时改 `src-tauri/src/database/schema.rs`,递增版本号并添加迁移逻辑(当前 `SCHEMA_VERSION = 10`,定义在 `database/mod.rs`)
+2. **从项目根目录直接跑 `cargo fmt`** — 必须加 `--manifest-path src-tauri/Cargo.toml`,否则找不到 crate
+3. **新增 Tauri command 不用 camelCase** — Tauri 2.0 要求 command 名用 camelCase(如 `getProviders`),不是 snake_case;且必须在 `src-tauri/src/lib.rs:1032` 的 `tauri::generate_handler![]` 注册
+4. **写配置文件没用原子写入** — 必须用 temp file + rename 模式,参考 `src-tauri/src/config.rs:204` 的 `atomic_write` 函数(不在 `services/`)
+5. **CI Node 20 vs 本地 Node 22** — `.node-version` 是 `22.12.0`,但 `.github/workflows/ci.yml` 用 `node-version: "20"`。本地 typecheck/test 跑通不代表 CI 通过,push 后留意 CI 结果
