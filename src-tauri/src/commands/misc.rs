@@ -888,7 +888,7 @@ fn launch_terminal_with_env(
     write_claude_config(&config_file, &env_vars)?;
 
     // 解析 claude 绝对路径，避免终端从 launchd 继承最小 PATH 时找不到命令
-    let claude_path = resolve_binary_path("claude").unwrap_or_else(|| "claude".to_string());
+    let claude_path = resolve_claude_binary_path();
 
     #[cfg(target_os = "macos")]
     {
@@ -947,23 +947,9 @@ fn launch_macos_terminal(
     let temp_dir = std::env::temp_dir();
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
-    let cd_command = build_shell_cd_command(cwd);
 
     // Write the shell script to a temp file
-    let script_content = format!(
-        r#"#!/bin/bash
-trap 'rm -f "{config_path}" "{script_file}"' EXIT
-{cd_command}
-echo "Using provider-specific claude config:"
-echo "{config_path}"
-{claude_path} --settings "{config_path}"
-exec "$SHELL" -l
-"#,
-        config_path = config_path,
-        script_file = script_file.display(),
-        cd_command = cd_command,
-        claude_path = claude_path,
-    );
+    let script_content = build_claude_terminal_script(claude_path, config_file, cwd, &script_file);
 
     std::fs::write(&script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
 
@@ -988,7 +974,12 @@ exec "$SHELL" -l
                 ),
                 "echo \"Using provider-specific claude config:\"".to_string(),
                 format!("echo \"{config_path}\""),
-                format!("{claude_path} --settings \"{config_path}\""),
+                claude_native_path_export_command(),
+                format!(
+                    "{} --settings {}",
+                    shell_single_quote(claude_path),
+                    shell_single_quote(&config_path)
+                ),
                 "\"$SHELL\" -l".to_string(),
             ]
             .into_iter()
@@ -1275,23 +1266,7 @@ fn launch_linux_terminal(
     // Create temp script file
     let temp_dir = std::env::temp_dir();
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
-    let config_path = config_file.to_string_lossy();
-    let cd_command = build_shell_cd_command(cwd);
-
-    let script_content = format!(
-        r#"#!/bin/bash
-trap 'rm -f "{config_path}" "{script_file}"' EXIT
-{cd_command}
-echo "Using provider-specific claude config:"
-echo "{config_path}"
-{claude_path} --settings "{config_path}"
-exec "$SHELL" -l
-"#,
-        config_path = config_path,
-        script_file = script_file.display(),
-        cd_command = cd_command,
-        claude_path = claude_path,
-    );
+    let script_content = build_claude_terminal_script(claude_path, config_file, cwd, &script_file);
 
     std::fs::write(&script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
 
@@ -1388,6 +1363,26 @@ fn resolve_binary_path(cmd: &str) -> Option<String> {
             Some(stdout)
         }
     }
+}
+
+fn resolve_claude_binary_path() -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return resolve_binary_path("claude").unwrap_or_else(|| "claude".to_string());
+    };
+
+    resolve_claude_binary_path_with(&home, |_| resolve_binary_path("claude"))
+}
+
+fn resolve_claude_binary_path_with<F>(home: &Path, resolve_from_path: F) -> String
+where
+    F: FnOnce(&str) -> Option<String>,
+{
+    let native_path = home.join(".local/bin/claude");
+    if native_path.is_file() {
+        return native_path.to_string_lossy().into_owned();
+    }
+
+    resolve_from_path("claude").unwrap_or_else(|| "claude".to_string())
 }
 
 /// 查找 Ghostty CLI 路径，优先使用 App Bundle 内的二进制，绕过 macOS open 的安全检查
@@ -1492,6 +1487,35 @@ fn build_shell_cd_command(cwd: Option<&Path>) -> String {
 
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn claude_native_path_export_command() -> String {
+    r#"export PATH="$HOME/.local/bin:$PATH""#.to_string()
+}
+
+fn build_claude_terminal_script(
+    claude_path: &str,
+    config_file: &Path,
+    cwd: Option<&Path>,
+    script_file: &Path,
+) -> String {
+    let config_path = config_file.to_string_lossy();
+    let script_path = script_file.to_string_lossy();
+    let cd_command = build_shell_cd_command(cwd);
+    let path_export = claude_native_path_export_command();
+
+    format!(
+        r#"#!/bin/bash
+trap 'rm -f "{config_path}" "{script_path}"' EXIT
+{path_export}
+{cd_command}echo "Using provider-specific claude config:"
+echo "{config_path}"
+{claude_command} --settings {settings_path}
+exec "$SHELL" -l
+"#,
+        claude_command = shell_single_quote(claude_path),
+        settings_path = shell_single_quote(&config_path),
+    )
 }
 
 /// 构建 CLI 终端启动脚本内容（纯函数，便于测试）
@@ -2165,6 +2189,39 @@ mod tests {
         let command = build_shell_cd_command(Some(Path::new("/tmp/project O'Brien")));
 
         assert_eq!(command, "cd '/tmp/project O'\"'\"'Brien' || exit 1\n");
+    }
+
+    #[test]
+    fn build_claude_terminal_script_prepends_native_bin_to_path() {
+        let script = build_claude_terminal_script(
+            "/Users/tester/.local/bin/claude",
+            Path::new("/tmp/config.json"),
+            None,
+            Path::new("/tmp/launcher.sh"),
+        );
+
+        assert!(script.contains("export PATH=\"$HOME/.local/bin:$PATH\""));
+        assert!(script.contains("'/Users/tester/.local/bin/claude' --settings '/tmp/config.json'"));
+    }
+
+    #[test]
+    fn resolve_claude_binary_path_prefers_native_install() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!("cc-switch-home-{unique}"));
+        let native = home.join(".local/bin/claude");
+        std::fs::create_dir_all(native.parent().expect("native path should have parent"))
+            .expect("native bin dir should be created");
+        std::fs::write(&native, "#!/bin/sh\n")
+            .expect("native claude placeholder should be written");
+
+        let resolved =
+            resolve_claude_binary_path_with(&home, |_| Some("/usr/local/bin/claude".into()));
+
+        assert_eq!(resolved, native.to_string_lossy().into_owned());
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[cfg(target_os = "macos")]
