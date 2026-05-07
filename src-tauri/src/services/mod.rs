@@ -1,4 +1,6 @@
 pub mod balance;
+pub mod cli_completion;
+pub mod cli_launcher;
 pub mod coding_plan;
 pub mod config;
 pub mod env_checker;
